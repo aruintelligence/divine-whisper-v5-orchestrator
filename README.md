@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Divine Whisper lineage repository.** This is a preserved experimental stage or supporting component. Start with the [canonical ecosystem index](https://github.com/aruintelligence/divine-whisper-ecosystem) for the complete version map, current context, and research-scope notice.
+
 ## Project Vision – What Divine Whisper Actually Is
 
 Divine Whisper is a multi-agent cognitive architecture designed to orchestrate specialized AI agents through a graph-based reasoning system. Instead of being a single AI model like GPT, Claude, or Grok, it functions more like an intelligence operating system that coordinates many models and reasoning modules.
