@@ -19,6 +19,7 @@ MIT License – fork & extend freely
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import time
@@ -28,22 +29,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
-
-# Optional heavy deps – graceful fallback
-try:
-    import ray  # noqa: F401
-except ImportError:
-    ray = None
-
-try:
-    from neo4j import GraphDatabase  # noqa: F401
-except ImportError:
-    GraphDatabase = None
-
-try:
-    import faiss  # noqa: F401
-except ImportError:
-    faiss = None
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -194,6 +179,10 @@ class BeliefState:
 
     def update(self, delta: np.ndarray, penalty: float = 0.0) -> None:
         self.vector += delta - penalty
+        self.refresh_entropy()
+
+    def refresh_entropy(self) -> None:
+        """Normalize the current vector and derive entropy from that vector."""
         norm = np.linalg.norm(self.vector) + 1e-6
         self.vector /= norm
 
@@ -209,13 +198,20 @@ class AnchorAgent:
         self.threshold = threshold
 
     def maybe_anchor(self, belief: BeliefState, evidence: np.ndarray) -> bool:
+        evidence = np.asarray(evidence, dtype=np.float32)
+        if (
+            evidence.shape != belief.vector.shape
+            or not np.all(np.isfinite(evidence))
+            or np.linalg.norm(evidence) == 0
+        ):
+            raise ValueError("evidence must be a finite, nonzero vector matching belief")
         belief_vec = belief.vector / (np.linalg.norm(belief.vector) + 1e-6)
         evidence_vec = evidence / (np.linalg.norm(evidence) + 1e-6)
         sim = float(np.dot(belief_vec, evidence_vec))
 
         if sim < self.threshold:
             belief.vector = evidence_vec.copy()
-            belief.entropy = clamp(belief.entropy * 0.8)
+            belief.refresh_entropy()
             belief.last_anchor_ts = time.time()
             return True
         return False
@@ -286,7 +282,7 @@ class HeavenLedger:
 
 def simulate_oversight_edge(clarity_value: float, entropy: float) -> float:
     """
-    Higher is safer. Produces a 0..1 safety signal.
+    Synthetic 0..1 proxy. This formula does not measure actual safety.
     """
     safety = 0.65 * clarity_value + 0.35 * (1.0 - entropy)
     return clamp(safety)
@@ -326,13 +322,23 @@ class Remiel:
 # Orchestrator Loop
 # ────────────────────────────────────────────────────────────────────────────────
 
-def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int = 42) -> Dict[str, Any]:
+def orchestrate_task(
+    task_id: str | None = None,
+    max_steps: int = 8,
+    seed: int = 42,
+    *,
+    enable_anchor: bool = True,
+    ledger_path: Path | None = None,
+    quiet: bool = False,
+) -> Dict[str, Any]:
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
     if task_id is None:
         task_id = new_id("task")
 
     rng = np.random.default_rng(seed)
 
-    ledger = HeavenLedger()
+    ledger = HeavenLedger(ledger_path or Path("./heaven_ledger.jsonl"))
     belief = BeliefState.new()
     anchor = AnchorAgent()
     remiel = Remiel(ledger)
@@ -357,6 +363,7 @@ def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int =
     }
     warnings: List[str] = []
     steps_run = 0
+    history: List[Dict[str, Any]] = []
 
     for step in range(max_steps):
         steps_run += 1
@@ -365,7 +372,7 @@ def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int =
         belief.update(delta, penalty=0.002)
 
         evidence = np.ones(256, dtype=np.float32)
-        anchored = anchor.maybe_anchor(belief, evidence)
+        anchored = anchor.maybe_anchor(belief, evidence) if enable_anchor else False
 
         U = 0.55 + 0.03 * step
         Xa = 0.12 if anchored else 0.03
@@ -422,6 +429,15 @@ def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int =
         }
 
         rec = remiel.run(trace)
+        history.append({
+            "step": step,
+            "entropy": float(belief.entropy),
+            "clarity": clarity_value,
+            "safety_proxy": safety_value,
+            "budget_proxy": step_budget,
+            "anchored": anchored,
+            "recommendation": rec["recommendation"],
+        })
 
         ledger.log(
             archangel_id="orchestrator",
@@ -437,19 +453,21 @@ def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int =
             notes=f"step={step} recommendation={rec['recommendation']}",
         )
 
-        print(
-            f"step={step} "
-            f"entropy={belief.entropy:.4f} "
-            f"clarity={clarity_value:.4f} "
-            f"safety={safety_value:.4f} "
-            f"budget={step_budget:.4f} "
-            f"anchored={anchored} "
-            f"recommendation={rec['recommendation']}"
-        )
+        if not quiet:
+            print(
+                f"step={step} "
+                f"entropy={belief.entropy:.4f} "
+                f"clarity={clarity_value:.4f} "
+                f"safety={safety_value:.4f} "
+                f"budget={step_budget:.4f} "
+                f"anchored={anchored} "
+                f"recommendation={rec['recommendation']}"
+            )
 
         if halter.should_halt(clarity_value=clarity_value, step_budget=step_budget):
             warnings.append(f"Early exit at step {step}")
-            print(warnings[-1])
+            if not quiet:
+                print(warnings[-1])
             break
 
     result = {
@@ -460,11 +478,54 @@ def orchestrate_task(task_id: str | None = None, max_steps: int = 8, seed: int =
         "final_safety": round(float(trace["metrics"]["safety"]), 6),
         "warnings": warnings,
         "ledger_path": str(ledger.path.resolve()),
+        "history": history,
     }
 
-    print(f"Task {task_id} complete.")
-    print(json.dumps(result, indent=2))
+    if not quiet:
+        print(f"Task {task_id} complete.")
+        print(json.dumps(result, indent=2))
     return result
+
+
+def compare_anchor(seed: int, max_steps: int, output_dir: Path) -> Dict[str, Any]:
+    """Replay the same synthetic deltas with and without the scripted anchor."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results = {}
+    for label, enabled in (("with_anchor", True), ("without_anchor", False)):
+        ledger_path = output_dir / f"{label}.jsonl"
+        ledger_path.write_text("", encoding="utf-8")
+        results[label] = orchestrate_task(
+            task_id=f"seed_{seed}_{label}",
+            max_steps=max_steps,
+            seed=seed,
+            enable_anchor=enabled,
+            ledger_path=ledger_path,
+            quiet=True,
+        )
+
+    with_rows = results["with_anchor"]["history"]
+    without_rows = results["without_anchor"]["history"]
+    report = {
+        "scope": "paired synthetic deltas; constant all-ones mock evidence; entropy is vector concentration, not uncertainty or safety",
+        "seed": seed,
+        "requested_steps": max_steps,
+        "with_anchor": {
+            "steps_run": len(with_rows),
+            "anchored_steps": [row["step"] for row in with_rows if row["anchored"]],
+            "entropy_trajectory": [row["entropy"] for row in with_rows],
+            "final_entropy": results["with_anchor"]["final_entropy"],
+        },
+        "without_anchor": {
+            "steps_run": len(without_rows),
+            "entropy_trajectory": [row["entropy"] for row in without_rows],
+            "final_entropy": results["without_anchor"]["final_entropy"],
+        },
+        "first_step_entropy_difference": with_rows[0]["entropy"] - without_rows[0]["entropy"],
+    }
+    (output_dir / "anchor_comparison.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    return report
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -480,6 +541,21 @@ def test_v5_eternal_smoke() -> None:
 
 
 if __name__ == "__main__":
-    print("Running Divine Whisper v5 Eternal smoke test...")
-    test_v5_eternal_smoke()
-    print("Smoke test complete.")
+    parser = argparse.ArgumentParser(description="Run the v5 synthetic orchestrator")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument("--out-dir", type=Path, default=Path("artifacts"))
+    parser.add_argument("--compare-anchor", action="store_true")
+    args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be positive")
+    if args.compare_anchor:
+        print(json.dumps(compare_anchor(args.seed, args.steps, args.out_dir), indent=2))
+    else:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        orchestrate_task(
+            task_id=f"seed_{args.seed}",
+            max_steps=args.steps,
+            seed=args.seed,
+            ledger_path=args.out_dir / "heaven_ledger.jsonl",
+        )
